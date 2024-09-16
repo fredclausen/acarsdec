@@ -16,185 +16,113 @@
  *   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  *
  */
+
+#ifndef acarsdec_h
+#define acarsdec_h
+
+#include <stdbool.h>
 #include <sys/time.h>
 #include <time.h>
-#include <pthread.h>
 #include <complex.h>
 #ifdef HAVE_LIBACARS
 #include <libacars/libacars.h>
 #include <libacars/reassembly.h>
 #endif
 
-#define ACARSDEC_VERSION "3.7"
+#define ACARSDEC_VERSION "4.0"
 
-#define MAXNBCHANNELS 16
-#define INTRATE 12500
+#ifndef HOST_NAME_MAX
+#define HOST_NAME_MAX 255
+#endif
 
-#define NETLOG_NONE 0
-#define NETLOG_PLANEPLOTTER 1
-#define NETLOG_NATIVE 2
-#define NETLOG_JSON 3
-#define NETLOG_MQTT 4
+#define INTRATE 12500U	// 12.5kHz: ACARS is 2400Bd NRZI, AM 10kHz BW with a 1800Hz Fc, 1200Hz shift MSK.
+#define DMBUFSZ	1024U
 
-#define OUTTYPE_NONE 0
-#define OUTTYPE_ONELINE 1
-#define OUTTYPE_STD 2
-#define OUTTYPE_MONITOR 3
-#define OUTTYPE_JSON 4
-#define OUTTYPE_ROUTEJSON 5
+#define ARRAY_SIZE(x)	(sizeof(x) / sizeof(x[0]))
 
-typedef float sample_t;
+#ifdef __GNUC__
+ #define likely(x)	__builtin_expect(!!(x), 1)
+ #define unlikely(x)	__builtin_expect(!!(x), 0)
+#else
+ #define likely(x)	(x)
+ #define unlikely(x)	(x)
+#endif
+
+#define vprerr(fmt, ...)	do { if (unlikely(R.verbose)) fprintf(stderr, fmt, ## __VA_ARGS__); } while(0)
 
 typedef struct mskblk_s {
 	struct mskblk_s *prev;
-	int chn;
 	struct timeval tv;
+	float lvl;
+	int chn;
 	int len;
 	int err;
-	float lvl;
-	char txt[250];
 	unsigned char crc[2];
+	char txt[250];
 } msgblk_t;
 
 typedef struct {
-	int chn;
+	msgblk_t *blk;
+	float complex *oscillator;
 
-#if defined(WITH_RTL) || defined(WITH_AIR)
-	int Fr;
-	float complex *wf;
-#endif
-#if defined(WITH_AIR)
-	float complex D;
-#endif
-#if defined(WITH_SDRPLAY) || defined(WITH_SOAPY)
-	float	Fr;
-        float	complex *oscillator;
-        float	complex D;
-	int	counter;
-#endif
-
-	float *dm_buffer;
+	float *dm_buffer;		// INTRATE-sampled signal buffer
+	float complex *inb;
 	double MskPhi;
 	double MskDf;
-	float MskClk;
 	double MskLvlSum;
+	float MskClk;
 	int MskBitCount;
-	unsigned int MskS,idx;
-	float complex *inb;
+	unsigned int MskS, idx;
 
+	int chn;
+	unsigned int Fr;		// channel frequency (in Hz)
+
+	enum { WSYN, SYN2, SOH1, TXT, CRC1, CRC2, END } Acarsstate;
+	int nbits;
 	unsigned char outbits;
-	int	nbits;
-
-	enum { WSYN, SYN2, SOH1, TXT, CRC1,CRC2, END } Acarsstate;
-	msgblk_t *blk;
-
-	pthread_t th;
 } channel_t;
 
-typedef struct {
-        char da[5];
-        char sa[5];
-        char eta[5];
-        char gout[5];
-        char gin[5];
-        char woff[5];
-        char won[5];
-} oooi_t;
+typedef struct output_s {
+	enum { FMT_ONELINE = 1, FMT_FULL, FMT_MONITOR, FMT_PP, FMT_NATIVE, FMT_JSON, FMT_ROUTEJSON } fmt;
+	enum { DST_FILE = 1, DST_UDP, DST_MQTT } dst;
+	void *params;
+	void *priv;
+	struct output_s *next;
+} output_t;
 
 typedef struct {
-        char mode;
-        char addr[8];
-        char ack;
-        char label[3];
-        char bid;
-        char no[5];
-        char fid[7];
-        char sublabel[3];
-        char mfi[3];
-        char bs, be;
-        char *txt;
-        int err;
-        float lvl;
+	channel_t *channels;
+	unsigned int nbch;
+	volatile bool running;
+	bool verbose;
+
+	// used only in output
+	bool airflt;
+	bool emptymsg;
+	bool statsd;
 #ifdef HAVE_LIBACARS
-        char msn[4];
-        char msn_seq;
-        la_proto_node *decoded_tree;
-        la_reasm_status reasm_status;
+	bool skip_reassembly;
 #endif
-} acarsmsg_t;
+	int mdly;
+	output_t *outputs;
+	char *idstation;
 
-extern channel_t channel[MAXNBCHANNELS];
-extern unsigned int  nbch;
-extern unsigned long wrktot;
-extern unsigned long wrkmask;
-extern pthread_mutex_t datamtx;
-extern pthread_cond_t datawcd;
+	enum { IN_NONE = 0, IN_ALSA, IN_SNDFILE, IN_RTL, IN_AIR, IN_SDRPLAY, IN_SOAPY } inmode;
 
-extern int signalExit;
+	// used only during setup
+	float gain;
+	int ppm;
+	int bias;
+	unsigned int rateMult;
+	int lnaState;
+	int GRdB;
+	unsigned int Fc, minFc, maxFc;
 
-extern int inpmode;
-extern int verbose;
-extern int outtype;
-extern int netout;
-extern int airflt;
-extern int emptymsg;
-extern int mdly;
-extern int hourly, daily;
-
-extern int ppm;
-extern	int	lnaState;
-extern	int	GRdB;
-extern int initOutput(char*,char *);
-
-#ifdef HAVE_LIBACARS
-extern int skip_reassembly;
-#endif
-#ifdef WITH_ALSA
-extern int initAlsa(char **argv,int optind);
-extern int runAlsaSample(void);
-#endif
-#ifdef WITH_SNDFILE
-extern int initSoundfile(char **argv,int optind);
-extern int runSoundfileSample(void);
-#endif
-#ifdef WITH_RTL
-extern int initRtl(char **argv,int optind);
-extern int runRtlSample(void);
-extern int runRtlCancel(void);
-extern int runRtlClose(void);
-extern int rtlMult;
-#endif
-#ifdef WITH_AIR
-extern int initAirspy(char **argv,int optind);
-extern int runAirspySample(void);
-#endif
 #ifdef WITH_SOAPY
-extern int initSoapy(char **argv,int optind);
-extern int soapySetAntenna(const char *antenna);
-extern int runSoapySample(void);
-extern int runSoapyClose(void);
-extern int rateMult;
-extern int freq;
-extern double gain;
-#else
-extern int gain;
+	char *antenna;
 #endif
-#ifdef WITH_MQTT
-extern int MQTTinit(char **urls, char * client_id, char *topic, char *user,char *passwd);
-extern int MQTTsend(char *msgtxt);
-extern void MQTTend();
-#endif
+} runtime_t;
 
-extern int initRaw(char **argv,int optind);
-extern int runRawSample(void);
-extern int  initMsk(channel_t *);
-extern void demodMSK(channel_t *ch,int len);
+extern runtime_t R;
 
-
-extern int  initAcars(channel_t *);
-extern void decodeAcars(channel_t *);
-extern int  deinitAcars(void);
-
-extern int DecodeLabel(acarsmsg_t *msg,oooi_t *oooi);
-
-extern void outputmsg(const msgblk_t*);
+#endif /* acarsdec_h */

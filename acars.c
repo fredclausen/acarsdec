@@ -17,7 +17,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
 #include "acarsdec.h"
+#include "output.h"
+#include "statsd.h"
 
 #define SYN 0x16
 #define SOH 0x01
@@ -29,14 +32,14 @@
 /* message queue */
 static pthread_mutex_t blkq_mtx;
 static pthread_cond_t blkq_wcd;
-static msgblk_t *blkq_s,*blkq_e;
+static msgblk_t *blkq_s, *blkq_e;
 static pthread_t blkth_id;
 
 static int acars_shutdown;
 
 #include "syndrom.h"
 
-static int fixprerr(msgblk_t * blk, const unsigned short crc, int *pr, int pn)
+static int fixprerr(msgblk_t *blk, const unsigned short crc, int *pr, int pn)
 {
 	int i;
 
@@ -63,9 +66,9 @@ static int fixprerr(msgblk_t * blk, const unsigned short crc, int *pr, int pn)
 	}
 }
 
-static int fixdberr(msgblk_t * blk, const unsigned short crc)
+static int fixdberr(msgblk_t *blk, const unsigned short crc)
 {
-	int i,j,k;
+	int i, j, k;
 
 	/* test remainding error in crc */
 	for (i = 0; i < 2 * 8; i++)
@@ -74,17 +77,18 @@ static int fixdberr(msgblk_t * blk, const unsigned short crc)
 		}
 
 	/* test double error in bytes */
-	for (k = 0; k < blk->len ; k++) {
-	  int bo=8*(blk->len-k+1);
-	  for (i = 0; i < 8; i++)
-	   for (j = 0; j < 8; j++) {
-		   if(i==j) continue;
-		   if((crc^syndrom[i+bo]^syndrom[j+bo])==0) {
-			   blk->txt[k] ^= (1 << i);
-			   blk->txt[k] ^= (1 << j);
-			   return 1;
-		   }
-	   }
+	for (k = 0; k < blk->len; k++) {
+		int bo = 8 * (blk->len - k + 1);
+		for (i = 0; i < 8; i++)
+			for (j = 0; j < 8; j++) {
+				if (i == j)
+					continue;
+				if ((crc ^ syndrom[i + bo] ^ syndrom[j + bo]) == 0) {
+					blk->txt[k] ^= (1 << i);
+					blk->txt[k] ^= (1 << j);
+					return 1;
+				}
+			}
 	}
 	return 0;
 }
@@ -94,12 +98,11 @@ static void *blk_thread(void *arg)
 {
 	do {
 		msgblk_t *blk;
-		int i, pn;
+		int i, pn, chn;
 		unsigned short crc;
 		int pr[MAXPERR];
 
-		if (verbose)
-			fprintf(stderr, "blk_starting\n");
+		vprerr("blk_starting\n");
 
 		/* get a message */
 		pthread_mutex_lock(&blkq_mtx);
@@ -117,13 +120,18 @@ static void *blk_thread(void *arg)
 			blkq_s = NULL;
 		pthread_mutex_unlock(&blkq_mtx);
 
-		if (verbose)
-			fprintf(stderr, "get message #%d\n", blk->chn + 1);
+		chn = blk->chn;
+
+		vprerr("get message #%d\n", chn+1);
+
+		if (R.statsd)
+			statsd_inc_per_channel(chn, "decoder.msg.count");
 
 		/* handle message */
 		if (blk->len < 13) {
-			if (verbose)
-				fprintf(stderr, "#%d too short\n", blk->chn + 1);
+			vprerr("#%d too short\n", chn+1);
+			if (R.statsd)
+				statsd_inc_per_channel(chn, "decoder.errors.too_short");
 			free(blk);
 			continue;
 		}
@@ -143,67 +151,71 @@ static void *blk_thread(void *arg)
 			}
 		}
 		if (pn > MAXPERR) {
-			if (verbose)
-				fprintf(stderr,
-					"#%d too many parity errors: %d\n",
-					blk->chn + 1, pn);
+			vprerr("#%d too many parity errors: %d\n", chn+1, pn);
+			if (R.statsd)
+				statsd_inc_per_channel(chn, "decoder.errors.parity_excess");
 			free(blk);
 			continue;
 		}
-		if (pn > 0 && verbose)
-			fprintf(stderr, "#%d parity error(s): %d\n",
-				blk->chn + 1, pn);
+		if (pn > 0)
+			vprerr("#%d parity error(s): %d\n", chn+1, pn);
 		blk->err = pn;
 
 		/* crc check */
 		crc = 0;
-		for (i = 0; i < blk->len; i++) {
+		for (i = 0; i < blk->len; i++)
 			update_crc(crc, blk->txt[i]);
-
-		}
 		update_crc(crc, blk->crc[0]);
 		update_crc(crc, blk->crc[1]);
-		if (crc && verbose)
-			fprintf(stderr, "#%d crc error\n", blk->chn + 1);
+		if (crc) {
+			vprerr("#%d crc error\n", chn+1);
+			if (R.statsd)
+				statsd_inc_per_channel(chn, "decoder.errors.crc");
+		}
 
 		/* try to fix error */
-		if(pn) {
-		  if (fixprerr(blk, crc, pr, pn) == 0) {
-			if (verbose)
-				fprintf(stderr, "#%d not able to fix errors\n", blk->chn + 1);
-			free(blk);
-			continue;
-		  }
-			if (verbose)
-				fprintf(stderr, "#%d errors fixed\n", blk->chn + 1);
-		} else {
-		
-
-		  if (crc) {
-			 if(fixdberr(blk, crc) == 0) {
-				if (verbose)
-					fprintf(stderr, "#%d not able to fix errors\n", blk->chn + 1);
+		if (pn) {
+			if (fixprerr(blk, crc, pr, pn) == 0) {
+				vprerr("#%d not able to fix errors\n", chn+1);
 				free(blk);
 				continue;
-		  	}
-		  	if (verbose)
-				fprintf(stderr, "#%d errors fixed\n", blk->chn + 1);
-		  }
+			}
+			vprerr("#%d errors fixed\n", chn+1);
+		} else {
+			if (crc) {
+				if (fixdberr(blk, crc) == 0) {
+					vprerr("#%d not able to fix errors\n", chn+1);
+					free(blk);
+					continue;
+				}
+				vprerr("#%d errors fixed\n", chn+1);
+			}
 		}
 
 		/* redo parity checking and removing */
 		pn = 0;
 		for (i = 0; i < blk->len; i++) {
-			if ((numbits[(unsigned char)(blk->txt[i])] & 1) == 0) {
+			if ((numbits[(unsigned char)(blk->txt[i])] & 1) == 0)
 				pn++;
-			}
 			blk->txt[i] &= 0x7f;
 		}
 		if (pn) {
-			fprintf(stderr, "#%d parity check problem\n",
-				blk->chn + 1);
+			fprintf(stderr, "#%d parity check problem\n", chn+1);
 			free(blk);
 			continue;
+		}
+
+		if (R.statsd) {
+			char pfx[16];
+			statsd_metric_t metrics[] = {
+				{ .type = STATSD_UCOUNTER, .name = "decoder.msg.good", .value.u = 1 },
+				{ .type = STATSD_LGAUGE, .name = "decoder.msg.errs", .value.l = blk->err },
+				{ .type = STATSD_FGAUGE, .name = "decoder.msg.lvl", .value.f = blk->lvl },
+				{ .type = STATSD_LGAUGE, .name = "decoder.msg.len", .value.l = blk->len },
+			};
+			// use the frequency if available, else the channel number
+			snprintf(pfx, sizeof(pfx), "%u.", R.channels[chn].Fr ? R.channels[chn].Fr : chn+1);
+			statsd_update(pfx, metrics, ARRAY_SIZE(metrics));
 		}
 
 		outputmsg(blk);
@@ -214,15 +226,14 @@ static void *blk_thread(void *arg)
 	return NULL;
 }
 
-
-int initAcars(channel_t * ch)
+int initAcars(channel_t *ch)
 {
-	if(ch->chn==0) {
-        	/* init global message queue */
-        	pthread_mutex_init(&blkq_mtx, NULL);
-        	pthread_cond_init(&blkq_wcd, NULL);
-        	blkq_e=blkq_s=NULL;
-        	pthread_create(&blkth_id , NULL, blk_thread, NULL);
+	if (ch->chn == 0) {
+		/* init global message queue */
+		pthread_mutex_init(&blkq_mtx, NULL);
+		pthread_cond_init(&blkq_wcd, NULL);
+		blkq_e = blkq_s = NULL;
+		pthread_create(&blkth_id, NULL, blk_thread, NULL);
 
 		acars_shutdown = 0;
 	}
@@ -236,19 +247,18 @@ int initAcars(channel_t * ch)
 	return 0;
 }
 
-static void resetAcars(channel_t * ch)
+static void resetAcars(channel_t *ch)
 {
 	ch->Acarsstate = WSYN;
 	ch->MskDf = 0;
 	ch->nbits = 1;
 }
 
-void decodeAcars(channel_t * ch)
+void decodeAcars(channel_t *ch)
 {
 	unsigned char r = ch->outbits;
 
 	switch (ch->Acarsstate) {
-
 	case WSYN:
 		if (r == SYN) {
 			ch->Acarsstate = SYN2;
@@ -280,9 +290,10 @@ void decodeAcars(channel_t * ch)
 
 	case SOH1:
 		if (r == SOH) {
-			if(ch->blk == NULL) {
-				ch->blk = malloc(sizeof(msgblk_t));
-				if(ch->blk == NULL) {
+			if (ch->blk == NULL) {
+				ch->blk = malloc(sizeof(*ch->blk));
+				if (ch->blk == NULL) {
+					perror(NULL);
 					resetAcars(ch);
 					return;
 				}
@@ -308,10 +319,7 @@ void decodeAcars(channel_t * ch)
 			ch->blk->err++;
 
 			if (ch->blk->err > MAXPERR + 1) {
-				if (verbose)
-					fprintf(stderr,
-						"#%d too many parity errors\n",
-						ch->chn + 1);
+				vprerr("#%d too many parity errors\n", ch->chn + 1);
 				resetAcars(ch);
 				return;
 			}
@@ -322,9 +330,7 @@ void decodeAcars(channel_t * ch)
 			return;
 		}
 		if (ch->blk->len > 20 && r == DLE) {
-			if (verbose)
-				fprintf(stderr, "#%d miss txt end\n",
-					ch->chn + 1);
+			vprerr("#%d miss txt end\n", ch->chn + 1);
 			ch->blk->len -= 3;
 			ch->blk->crc[0] = ch->blk->txt[ch->blk->len];
 			ch->blk->crc[1] = ch->blk->txt[ch->blk->len + 1];
@@ -332,8 +338,7 @@ void decodeAcars(channel_t * ch)
 			goto putmsg_lbl;
 		}
 		if (ch->blk->len > 240) {
-			if (verbose)
-				fprintf(stderr, "#%d too long\n", ch->chn + 1);
+			vprerr("#%d too long\n", ch->chn + 1);
 			resetAcars(ch);
 			return;
 		}
@@ -347,11 +352,10 @@ void decodeAcars(channel_t * ch)
 		return;
 	case CRC2:
 		ch->blk->crc[1] = r;
- putmsg_lbl:
-		ch->blk->lvl = 10*log10(ch->MskLvlSum / ch->MskBitCount);
+putmsg_lbl:
+		ch->blk->lvl = 10 * log10(ch->MskLvlSum / ch->MskBitCount);
 
-		if (verbose)
-			fprintf(stderr, "put message #%d\n", ch->chn + 1);
+		vprerr("put message #%d\n", ch->chn + 1);
 
 		pthread_mutex_lock(&blkq_mtx);
 		ch->blk->prev = NULL;
@@ -363,7 +367,7 @@ void decodeAcars(channel_t * ch)
 		pthread_cond_signal(&blkq_wcd);
 		pthread_mutex_unlock(&blkq_mtx);
 
-		ch->blk=NULL;
+		ch->blk = NULL;
 		ch->Acarsstate = END;
 		ch->nbits = 8;
 		return;
@@ -373,7 +377,6 @@ void decodeAcars(channel_t * ch)
 		return;
 	}
 }
-
 
 int deinitAcars(void)
 {

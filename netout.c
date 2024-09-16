@@ -1,3 +1,23 @@
+/*
+ *  Copyright (c) 2015 Thierry Leconte
+ *  Copyright (c) 2024 Thibaut VARENE
+ *
+ *
+ *   This code is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU Library General Public License version 2
+ *   published by the Free Software Foundation.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU Library General Public License for more details.
+ *
+ *   You should have received a copy of the GNU Library General Public
+ *   License along with this library; if not, write to the Free Software
+ *   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *
+ */
+
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,144 +30,86 @@
 #include <errno.h>
 
 #include "acarsdec.h"
+#include "netout.h"
 
-static int sockfd = -1;
-static char *netOutputRawaddr = NULL;
+#define ERRPFX	"ERROR: UDP: "
+#define WARNPFX	"WARNING: UDP: "
 
-
-int Netoutinit(char *Rawaddr)
+// params is "host=xxx,port=yyy"
+netout_t *Netoutinit(char *params)
 {
-	char *addr;
-	char *port;
+	char *param, *sep;
+	char *addr = NULL;
+	char *port = NULL;
 	struct addrinfo hints, *servinfo, *p;
-	int rv;
+	int sockfd, rv;
+	netout_t *netpriv = NULL;
 
-	netOutputRawaddr = Rawaddr;
-
-	memset(&hints, 0, sizeof hints);
-	if (Rawaddr[0] == '[') {
-		hints.ai_family = AF_INET6;
-		addr = Rawaddr + 1;
-		port = strstr(addr, "]");
-		if (port == NULL) {
-			fprintf(stderr, "Invalid IPV6 address\n");
-			return -1;
-		}
-		*port = 0;
-		port++;
-		if (*port != ':')
-			port = "5555";
-		else
-			port++;
-	} else {
-		hints.ai_family = AF_UNSPEC;
-		addr = Rawaddr;
-		port = strstr(addr, ":");
-		if (port == NULL)
-			port = "5555";
-		else {
-			*port = 0;
-			port++;
-		}
+	while ((param = strsep(&params, ","))) {
+		sep = strchr(param, '=');
+		if (!sep)
+			continue;
+		*sep++ = '\0';
+		if (!strcmp("host", param))
+			addr = sep;
+		else if (!strcmp("port", param))
+			port = sep;
 	}
 
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_protocol = IPPROTO_UDP;
+	if (port == NULL)
+		port = "5555";
+
+	vprerr("UDP: Attempting to resolve '%s:%s'.\n", addr, port);
 
 	if ((rv = getaddrinfo(addr, port, &hints, &servinfo)) != 0) {
-		fprintf(stderr, "Invalid/unknown address %s\n", addr);
-		return -1;
+		fprintf(stderr, ERRPFX "Invalid/unknown error '%s' resolving '%s:%s'\n", gai_strerror(rv), addr, port);
+		return NULL;
 	}
 
 	for (p = servinfo; p != NULL; p = p->ai_next) {
-		if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
-		continue;
-		}
-
-		if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-			close(sockfd);
-			continue;
-		}
-		break;
-	}
-	if (p == NULL) {
-		fprintf(stderr, "failed to connect\n");
-		return -1;
+		sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+		if (-1 != sockfd)
+			break;	// success
 	}
 
+	if (!p) {
+		fprintf(stderr, ERRPFX "failed to resolve: '%s:%s'\n", addr, port);
+		goto fail;
+	}
+
+	netpriv = malloc(sizeof(*netpriv));
+	if (!netpriv) {
+		perror(NULL);
+		goto fail;
+	}
+
+	memcpy(&netpriv->netOutputAddr, p->ai_addr, p->ai_addrlen);
+	netpriv->netOutputAddrLen = p->ai_addrlen;
+	netpriv->sockfd = sockfd;
+
+fail:
 	freeaddrinfo(servinfo);
-
-	return 0;
+	return netpriv;
 }
 
-static int Netwrite(const void *buf, size_t count) {
-    if (!netOutputRawaddr) {
-        return -1;
-    }
-
-    int res;
-    res = write(sockfd, buf, count);
-    if (res == -1) {
-        perror("Netwrite");
-        close(sockfd);
-        // retry the write if the reconnect succeeds
-        if (Netoutinit(netOutputRawaddr) == 0) {
-            res = write(sockfd, buf, count);
-        }
-    }
-    return res;
-}
-
-
-void Netoutpp(acarsmsg_t * msg)
+void Netwrite(const void *buf, size_t count, netout_t *net)
 {
-	char pkt[3600]; // max. 16 blocks * 220 characters + extra space for msg prefix
-	char *pstr;
 	int res;
 
-	char *txt = strdup(msg->txt);
-	for (pstr = txt; *pstr != 0; pstr++)
-		if (*pstr == '\n' || *pstr == '\r')
-			*pstr = ' ';
+	if (!net->netOutputAddrLen)
+		return;
 
-	snprintf(pkt, sizeof(pkt), "AC%1c %7s %1c %2s %1c %4s %6s %s",
-		msg->mode, msg->addr, msg->ack, msg->label, msg->bid ? msg->bid : '.', msg->no,
-		msg->fid, txt);
-
-	if (netOutputRawaddr) {
-		res=Netwrite(pkt, strlen(pkt));
-	}
-	free(txt);
+	res = sendto(net->sockfd, buf, count, 0, (struct sockaddr *)&net->netOutputAddr, net->netOutputAddrLen);
+	if (res < 0)
+		vprerr(WARNPFX "error on sendto(): %s, ignoring.\n", strerror(errno));
 }
 
-void Netoutsv(acarsmsg_t * msg, char *idstation, int chn, struct timeval tv)
+void Netexit(netout_t *net)
 {
-	char pkt[3600]; // max. 16 blocks * 220 characters + extra space for msg prefix
-	struct tm tmp;
-	int res;
-
-	gmtime_r(&(tv.tv_sec), &tmp);
-
-	snprintf(pkt, sizeof(pkt),
-		"%8s %1d %02d/%02d/%04d %02d:%02d:%02d %1d %03d %1c %7s %1c %2s %1c %4s %6s %s",
-		idstation, chn + 1, tmp.tm_mday, tmp.tm_mon + 1,
-		tmp.tm_year + 1900, tmp.tm_hour, tmp.tm_min, tmp.tm_sec,
-		msg->err, (int)(msg->lvl), msg->mode, msg->addr, msg->ack, msg->label,
-		msg->bid ? msg->bid : '.', msg->no, msg->fid, msg->txt);
-
-	if (netOutputRawaddr) {
-		res=Netwrite(pkt, strlen(pkt));
-	}
+	free(net);
 }
-
-void Netoutjson(char *jsonbuf)
-{
-	char pkt[3600];
-	int res;
-
-	snprintf(pkt, sizeof(pkt), "%s\n", jsonbuf);
-	if (netOutputRawaddr) {
-		res=Netwrite(pkt, strlen(pkt));
-	}
-}
-
-

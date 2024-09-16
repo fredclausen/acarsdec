@@ -16,40 +16,50 @@
  *   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  *
  */
-#ifdef WITH_SNDFILE
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <pthread.h>
 #include <sndfile.h>
 #include "acarsdec.h"
+#include "msk.h"
 
 #define MAXNBFRAMES 4096
+
+#define ERRPFX	"ERROR: SNDFILE: "
+
 static SNDFILE *insnd;
 
-int initSoundfile(char **argv, int optind)
+int initSoundfile(char *optarg)
 {
 	SF_INFO infsnd;
-	int n;
+	unsigned int n;
 
 	infsnd.format = 0;
-	insnd = sf_open(argv[optind], SFM_READ, &infsnd);
+	insnd = sf_open(optarg, SFM_READ, &infsnd);
 	if (insnd == NULL) {
-		fprintf(stderr, "could not open %s\n", argv[optind]);
+		fprintf(stderr, ERRPFX "could not open '%s'\n", optarg);
 		return (1);
 	}
-	nbch = infsnd.channels;
-	if (nbch > MAXNBCHANNELS) {
-		fprintf(stderr, "Too much input channels : %d\n", nbch);
+
+	if (infsnd.samplerate != INTRATE) {
+		fprintf(stderr, ERRPFX "unsupported sample rate : %d (must be %d)\n", infsnd.samplerate, INTRATE);
 		return (1);
 	}
-	if(infsnd.samplerate!=INTRATE) {
-		fprintf(stderr, "unsupported sample rate : %d (must be %d)\n",infsnd.samplerate,INTRATE);
-		return (1);
+
+	R.channels = calloc(infsnd.channels, sizeof(*R.channels));
+	if (!R.channels) {
+		perror(NULL);
+		return -1;
 	}
-	
-	for (n = 0; n < nbch; n++) {
-		channel[n].dm_buffer=malloc(sizeof(float)*MAXNBFRAMES);
+	R.nbch = infsnd.channels;
+
+	for (n = 0; n < R.nbch; n++) {
+		R.channels[n].dm_buffer = malloc(sizeof(*R.channels[n].dm_buffer) * MAXNBFRAMES);
+		if (!R.channels[n].dm_buffer) {
+			perror(NULL);
+			return -1;
+		}
 	}
 
 	return (0);
@@ -57,26 +67,27 @@ int initSoundfile(char **argv, int optind)
 
 int runSoundfileSample(void)
 {
-	int nbi, n, i;
-	sample_t sndbuff[MAXNBFRAMES * MAXNBCHANNELS];
+	int nbi, i;
+	unsigned int n;
+	float sndbuff[MAXNBFRAMES * R.nbch];
 
 	do {
-
-		nbi = sf_read_float(insnd, sndbuff, MAXNBFRAMES * nbch);
+		nbi = sf_read_float(insnd, sndbuff, MAXNBFRAMES * R.nbch);
 
 		if (nbi == 0) {
 			return -1;
 		}
 
-		for (n = 0; n < nbch; n++) {
-			int len = nbi / nbch;
+		for (n = 0; n < R.nbch; n++) {
+			int len = nbi / R.nbch;
 			for (i = 0; i < len; i++)
-				channel[n].dm_buffer[i]=sndbuff[n + i * nbch];
+				R.channels[n].dm_buffer[i] = sndbuff[n + i * R.nbch];
 
-			demodMSK(&(channel[n]),len);
+			demodMSK(&(R.channels[n]), len);
 		}
 
-	} while (1);
+	} while (R.running);
+	
 	return 0;
 }
 
@@ -94,7 +105,6 @@ void initSndWrite(void)
 		fprintf(stderr, "could not open data\n ");
 		return;
 	}
-
 }
 
 void SndWrite(float *in)
@@ -106,6 +116,4 @@ void SndWriteClose(void)
 {
 	sf_close(outsnd);
 }
-#endif
-
 #endif
